@@ -13,10 +13,23 @@ those directories and the shell aliases for you instead of you hand-editing
 
 ```bash
 chmod +x cam
-ln -sf "$PWD/cam" /usr/local/bin/cam    # or anywhere on your PATH
+BIN_DIR="$(command -v brew >/dev/null 2>&1 && brew --prefix)/bin"
+BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
+mkdir -p "$BIN_DIR"
+ln -sf "$PWD/cam" "$BIN_DIR/cam"
 ```
 
-Requires `jq` (`brew install jq`) and bash 3.2+ (macOS default is fine).
+`brew --prefix` resolves to `/usr/local` on Intel Macs and `/opt/homebrew` on
+Apple Silicon, so this works on either without hardcoding a path. Without
+Homebrew it falls back to `~/.local/bin` — make sure that's on your `PATH`
+(add `export PATH="$HOME/.local/bin:$PATH"` to your shell rc if not).
+
+Requires `jq` (`brew install jq` on macOS/Linuxbrew, or `apt install jq` /
+`dnf install jq` on Linux) and bash 3.2+. Works on macOS (Intel or Apple
+Silicon) and Linux; the shell-alias step supports both zsh and bash and
+targets whichever one your `$SHELL` points at (override with
+`CAM_SHELL_RC`). The keychain checks in `cam doctor` are macOS-only and are
+skipped automatically elsewhere.
 
 ## Concepts
 

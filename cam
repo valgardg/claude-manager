@@ -14,8 +14,24 @@ CAM_VERSION="1.0.0"
 CAM_HOME="${CAM_HOME:-$HOME/.config/cam}"
 CONFIG="$CAM_HOME/config.json"
 BACKUP_DIR="$CAM_HOME/backups"
-SHELL_RC="${CAM_SHELL_RC:-$HOME/.zshrc}"
 LEGACY_CONFIG="$HOME/.claude-manager.json"
+
+# Pick a sensible rc file when CAM_SHELL_RC isn't set: honor the user's actual
+# login shell rather than assuming zsh, since cam also runs on Linux/bash.
+default_shell_rc() {
+  case "${SHELL:-}" in
+    */zsh) printf '%s\n' "$HOME/.zshrc" ;;
+    */bash)
+      if [ "$(uname -s)" = "Darwin" ]; then
+        printf '%s\n' "$HOME/.bash_profile"
+      else
+        printf '%s\n' "$HOME/.bashrc"
+      fi
+      ;;
+    *) printf '%s\n' "$HOME/.zshrc" ;;
+  esac
+}
+SHELL_RC="${CAM_SHELL_RC:-$(default_shell_rc)}"
 
 # The marker block is inherited from the older claude-manager app so that
 # adopting an existing setup doesn't leave two managed blocks in the rc file.
@@ -112,9 +128,14 @@ account_email() {
 
 # Claude Code names each keychain entry Claude Code-credentials-<hash>, where
 # <hash> is the first 8 hex of sha256 of the config dir path. Returns that hash
-# for a given absolute path.
+# for a given absolute path. Prefer shasum (macOS default); fall back to
+# sha256sum, which is what most Linux distros ship instead.
 cred_hash() {
-  printf '%s' "$1" | shasum -a 256 2>/dev/null | cut -c1-8
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 2>/dev/null | cut -c1-8
+  elif command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum 2>/dev/null | cut -c1-8
+  fi
 }
 
 # Whether a keychain credential entry exists for a config dir.
@@ -513,6 +534,9 @@ cmd_doctor() {
     if [ -z "$email" ]; then
       warn "account '$name' → $(contract_path "$dir") — not logged in (run 'cam account login $name')"
       problems=$((problems + 1))
+    elif ! command -v security >/dev/null 2>&1; then
+      # No macOS Keychain on this platform (e.g. Linux) — skip that check.
+      ok "account '$name' → $(contract_path "$dir") — $email"
     elif has_credential "$dir"; then
       ok "account '$name' → $(contract_path "$dir") — $email"
     else
