@@ -1,0 +1,670 @@
+#!/usr/bin/env bash
+#
+# cam — Claude Account Manager
+#
+# Run multiple Claude Code accounts on one machine by giving each its own
+# CLAUDE_CONFIG_DIR. Manages accounts (isolated logins), projects (an account
+# bound to a directory), and the shell aliases that tie them together.
+#
+# Requires: bash 3.2+, jq
+
+set -euo pipefail
+
+CAM_VERSION="1.0.0"
+CAM_HOME="${CAM_HOME:-$HOME/.config/cam}"
+CONFIG="$CAM_HOME/config.json"
+BACKUP_DIR="$CAM_HOME/backups"
+SHELL_RC="${CAM_SHELL_RC:-$HOME/.zshrc}"
+LEGACY_CONFIG="$HOME/.claude-manager.json"
+
+# The marker block is inherited from the older claude-manager app so that
+# adopting an existing setup doesn't leave two managed blocks in the rc file.
+MARK_BEGIN="# >>> claude-manager >>>"
+MARK_END="# <<< claude-manager <<<"
+
+# ---------------------------------------------------------------- output ----
+
+if [ -t 1 ]; then
+  C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'; C_RED=$'\033[31m'
+  C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_OFF=$'\033[0m'
+else
+  C_DIM=''; C_BOLD=''; C_RED=''; C_GREEN=''; C_YELLOW=''; C_OFF=''
+fi
+
+die()  { printf '%serror:%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; exit 1; }
+warn() { printf '%swarn:%s %s\n' "$C_YELLOW" "$C_OFF" "$*" >&2; }
+ok()   { printf '%s✓%s %s\n' "$C_GREEN" "$C_OFF" "$*"; }
+info() { printf '%s\n' "$*"; }
+dim()  { printf '%s%s%s\n' "$C_DIM" "$*" "$C_OFF"; }
+
+# ------------------------------------------------------------ path utils ----
+
+# Store paths with a leading ~ so the config stays portable; expand on use.
+expand_path() {
+  case "$1" in
+    "~")    printf '%s\n' "$HOME" ;;
+    "~/"*)  printf '%s\n' "$HOME/${1#\~/}" ;;
+    *)      printf '%s\n' "$1" ;;
+  esac
+}
+
+contract_path() {
+  case "$1" in
+    "$HOME")   printf '~\n' ;;
+    "$HOME/"*) printf '~/%s\n' "${1#$HOME/}" ;;
+    *)         printf '%s\n' "$1" ;;
+  esac
+}
+
+# Resolve to an absolute path without requiring the target to exist.
+abs_path() {
+  local p; p="$(expand_path "$1")"
+  case "$p" in
+    /*) ;;
+    *)  p="$PWD/$p" ;;
+  esac
+  printf '%s\n' "${p%/}"
+}
+
+valid_name() {
+  case "$1" in
+    ''|*[!A-Za-z0-9_-]*) return 1 ;;
+    -*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# ---------------------------------------------------------------- config ----
+
+need_jq() {
+  command -v jq >/dev/null 2>&1 || die "jq is required but not installed. Try: brew install jq"
+}
+
+cfg_write() {
+  local tmp="$CONFIG.tmp.$$"
+  cat > "$tmp"
+  mv "$tmp" "$CONFIG"
+}
+
+cfg() { jq -r "$@" "$CONFIG"; }
+
+# Read a raw JSON value; empty string when absent.
+cfg_get() { jq -r "$1 // empty" "$CONFIG"; }
+
+account_dir()   { cfg_get ".accounts[\"$1\"].dir"; }
+account_alias() { cfg_get ".accounts[\"$1\"].alias"; }
+project_account() { cfg_get ".projects[\"$1\"].account"; }
+project_dir()     { cfg_get ".projects[\"$1\"].directory"; }
+
+account_exists() { [ -n "$(cfg_get ".accounts[\"$1\"]")" ]; }
+project_exists() { [ -n "$(cfg_get ".projects[\"$1\"]")" ]; }
+
+account_names() { cfg -r '.accounts | keys_unsorted[]' 2>/dev/null || true; }
+project_names() { cfg -r '.projects | keys_unsorted[]' 2>/dev/null || true; }
+
+# The email currently logged in to a config dir, read from its own
+# .claude.json. Non-secret; empty when the dir has never been logged in.
+account_email() {
+  local dir; dir="$(expand_path "$(account_dir "$1")")"
+  [ -f "$dir/.claude.json" ] || return 0
+  jq -r '.oauthAccount.emailAddress // empty' "$dir/.claude.json" 2>/dev/null || true
+}
+
+# Claude Code names each keychain entry Claude Code-credentials-<hash>, where
+# <hash> is the first 8 hex of sha256 of the config dir path. Returns that hash
+# for a given absolute path.
+cred_hash() {
+  printf '%s' "$1" | shasum -a 256 2>/dev/null | cut -c1-8
+}
+
+# Whether a keychain credential entry exists for a config dir.
+has_credential() {
+  command -v security >/dev/null 2>&1 || return 1
+  local h; h="$(cred_hash "$1")"
+  security find-generic-password -s "Claude Code-credentials-$h" >/dev/null 2>&1
+}
+
+# Derive an account name from a config dir basename: .claude-work -> work,
+# .claude -> default.
+name_from_dir() {
+  local base; base="$(basename "$1")"
+  case "$base" in
+    .claude)    printf 'default\n' ;;
+    .claude-*)  printf '%s\n' "${base#.claude-}" ;;
+    *)          printf '%s\n' "${base#.}" ;;
+  esac
+}
+
+ensure_config() {
+  need_jq
+  [ -f "$CONFIG" ] && return 0
+
+  mkdir -p "$CAM_HOME" "$BACKUP_DIR"
+  printf '{"version":1,"accounts":{},"projects":{}}\n' > "$CONFIG"
+
+  migrate_legacy
+}
+
+# ------------------------------------------------------------- migration ----
+
+# Import accounts from a prior claude-manager install: both the JSON state file
+# and any aliases already present in the managed rc block.
+migrate_legacy() {
+  local found=0
+
+  if [ -f "$LEGACY_CONFIG" ]; then
+    while IFS= read -r key; do
+      [ -n "$key" ] || continue
+      # Legacy keys are dir-ish names like "claude-personal".
+      local dir name
+      case "$key" in
+        claude) dir="$HOME/.claude" ;;
+        *)      dir="$HOME/.$key" ;;
+      esac
+      name="$(name_from_dir "$dir")"
+      register_account "$name" "$dir" "" && found=1
+    done < <(jq -r '.accounts // {} | keys_unsorted[]' "$LEGACY_CONFIG" 2>/dev/null || true)
+  fi
+
+  # Parse aliases out of an existing managed block. Format written by both the
+  # old app and this tool:
+  #   alias NAME='CLAUDE_CONFIG_DIR="$HOME/.claude-x" claude'
+  if [ -f "$SHELL_RC" ] && grep -qF "$MARK_BEGIN" "$SHELL_RC" 2>/dev/null; then
+    while IFS= read -r line; do
+      case "$line" in
+        alias\ *CLAUDE_CONFIG_DIR*)
+          local aname adir
+          aname="${line#alias }"; aname="${aname%%=*}"
+          adir="${line#*CLAUDE_CONFIG_DIR=\"}"; adir="${adir%%\"*}"
+          adir="${adir/\$HOME/$HOME}"
+          [ -n "$aname" ] && [ -n "$adir" ] || continue
+          register_account "$(name_from_dir "$adir")" "$adir" "$aname" && found=1
+          ;;
+      esac
+    done < <(sed -n "/$MARK_BEGIN/,/$MARK_END/p" "$SHELL_RC")
+  fi
+
+  if [ "$found" -eq 1 ]; then
+    ok "Adopted existing claude-manager setup into $CONFIG"
+    dim "  Run 'cam list' to review, 'cam alias sync' to regenerate your shell aliases."
+  fi
+}
+
+# register_account NAME DIR [ALIAS] — idempotent; returns 1 if nothing changed.
+register_account() {
+  local name="$1" dir="$2" alias_name="${3:-}"
+  valid_name "$name" || return 1
+
+  if [ -z "$alias_name" ]; then
+    if [ "$name" = "default" ]; then alias_name="claude"; else alias_name="claude-$name"; fi
+  fi
+
+  # Don't clobber an existing entry during migration.
+  account_exists "$name" && return 1
+
+  jq --arg n "$name" --arg d "$(contract_path "$dir")" --arg a "$alias_name" \
+     '.accounts[$n] = {dir:$d, alias:$a}' "$CONFIG" | cfg_write
+  return 0
+}
+
+# --------------------------------------------------------------- aliases ----
+
+render_block() {
+  printf '%s   (managed by cam — do not edit inside these markers)\n' "$MARK_BEGIN"
+  local name dir alias_name
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    dir="$(account_dir "$name")"
+    alias_name="$(account_alias "$name")"
+    printf 'alias %s=%sCLAUDE_CONFIG_DIR="%s" claude%s\n' \
+      "$alias_name" "'" "${dir/#\~/\$HOME}" "'"
+  done < <(account_names)
+  printf '%s\n' "$MARK_END"
+}
+
+backup_rc() {
+  [ -f "$SHELL_RC" ] || return 0
+  mkdir -p "$BACKUP_DIR"
+  local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
+  cp "$SHELL_RC" "$BACKUP_DIR/$(basename "$SHELL_RC").$stamp"
+}
+
+current_block() {
+  [ -f "$SHELL_RC" ] || return 0
+  grep -qF "$MARK_BEGIN" "$SHELL_RC" 2>/dev/null || return 0
+  sed -n "/$MARK_BEGIN/,/$MARK_END/p" "$SHELL_RC"
+}
+
+alias_sync() {
+  local desired current
+  desired="$(render_block)"
+  current="$(current_block)"
+
+  if [ "$desired" = "$current" ]; then
+    ok "Shell aliases already in sync ($SHELL_RC)"
+    return 0
+  fi
+
+  backup_rc
+  local tmp="$CAM_HOME/rc.tmp.$$"
+  local blockfile="$CAM_HOME/block.tmp.$$"
+  printf '%s\n' "$desired" > "$blockfile"
+
+  if [ -n "$current" ]; then
+    # Replace the existing block in place. The block is passed via a file
+    # because awk -v cannot carry a multi-line value.
+    awk -v b="$MARK_BEGIN" -v e="$MARK_END" -v bf="$blockfile" '
+      index($0, b) == 1 {
+        while ((getline line < bf) > 0) print line
+        close(bf); skip = 1; next
+      }
+      skip && index($0, e) == 1 { skip = 0; next }
+      !skip { print }
+    ' "$SHELL_RC" > "$tmp"
+  else
+    { [ -f "$SHELL_RC" ] && cat "$SHELL_RC"; printf '\n'; cat "$blockfile"; } > "$tmp"
+  fi
+
+  rm -f "$blockfile"
+  mv "$tmp" "$SHELL_RC"
+  ok "Wrote shell aliases to $SHELL_RC"
+  dim "  Backup in $BACKUP_DIR/"
+  dim "  Run: source $SHELL_RC"
+}
+
+alias_list() {
+  local name alias_name dir n=0
+  printf '%-16s %-22s %s\n' "ALIAS" "ACCOUNT" "CONFIG DIR"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    printf '%-16s %-22s %s\n' "$(account_alias "$name")" "$name" "$(account_dir "$name")"
+    n=$((n + 1))
+  done < <(account_names)
+  [ "$n" -eq 0 ] && dim "(no accounts yet — cam account add <name>)"
+
+  local desired current
+  desired="$(render_block)"; current="$(current_block)"
+  if [ "$desired" != "$current" ]; then
+    printf '\n'
+    warn "$SHELL_RC is out of sync — run 'cam alias sync'"
+  fi
+  return 0
+}
+
+# -------------------------------------------------------------- accounts ----
+
+cmd_account_add() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: cam account add <name>"
+  valid_name "$name" || die "invalid account name '$name' (use letters, digits, - and _)"
+  account_exists "$name" && die "account '$name' already exists"
+
+  local dir="$HOME/.claude-$name"
+  [ "$name" = "default" ] && dir="$HOME/.claude"
+
+  mkdir -p "$dir"
+  register_account "$name" "$dir" || die "failed to register account"
+  ok "Created account '$name' → $(contract_path "$dir")"
+
+  alias_sync
+  printf '\n'
+  info "Next: log in to this account."
+  dim "  cam account login $name        # then run /login inside the session"
+}
+
+cmd_account_list() {
+  local name dir email n=0
+  printf '%-12s %-20s %-16s %s\n' "ACCOUNT" "CONFIG DIR" "ALIAS" "LOGGED IN AS"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    dir="$(expand_path "$(account_dir "$name")")"
+    if [ ! -d "$dir" ]; then
+      email="(missing dir)"
+    else
+      email="$(account_email "$name")"
+      [ -n "$email" ] || email="(not logged in)"
+    fi
+    printf '%-12s %-20s %-16s %s\n' \
+      "$name" "$(account_dir "$name")" "$(account_alias "$name")" "$email"
+    n=$((n + 1))
+  done < <(account_names)
+  [ "$n" -eq 0 ] && dim "(no accounts yet — cam account add <name>)"
+  return 0
+}
+
+cmd_account_remove() {
+  local name="" purge=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --purge) purge=1 ;;
+      -*) die "unknown flag: $1" ;;
+      *) name="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$name" ] || die "usage: cam account remove <name> [--purge]"
+  account_exists "$name" || die "no such account: $name"
+
+  # Refuse to orphan projects.
+  local bound
+  bound="$(jq -r --arg a "$name" \
+    '[.projects | to_entries[] | select(.value.account == $a) | .key] | join(", ")' "$CONFIG")"
+  [ -n "$bound" ] && die "account '$name' is used by project(s): $bound
+Remove those projects first, or repoint them with 'cam project add ... --account <other>'."
+
+  local dir; dir="$(expand_path "$(account_dir "$name")")"
+
+  jq --arg n "$name" 'del(.accounts[$n])' "$CONFIG" | cfg_write
+  ok "Unregistered account '$name'"
+
+  if [ "$purge" -eq 1 ]; then
+    if [ -d "$dir" ]; then
+      printf 'Delete %s and its stored login? [y/N] ' "$dir"
+      local reply; read -r reply
+      case "$reply" in
+        y|Y|yes|YES) rm -rf "$dir"; ok "Deleted $dir" ;;
+        *) info "Kept $dir" ;;
+      esac
+    fi
+  else
+    dim "  Config dir left in place: $(contract_path "$dir")"
+    dim "  Use --purge to delete it."
+  fi
+
+  alias_sync
+}
+
+cmd_account_login() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: cam account login <name>"
+  account_exists "$name" || die "no such account: $name"
+  local dir; dir="$(expand_path "$(account_dir "$name")")"
+  mkdir -p "$dir"
+  info "Starting Claude with account '$name'. Run /login inside the session."
+  exec env CLAUDE_CONFIG_DIR="$dir" claude
+}
+
+# -------------------------------------------------------------- projects ----
+
+cmd_project_add() {
+  local name="" account="" directory=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --account|-a)   account="${2:-}"; shift ;;
+      --directory|-d) directory="${2:-}"; shift ;;
+      -*) die "unknown flag: $1" ;;
+      *)  name="$1" ;;
+    esac
+    shift
+  done
+
+  [ -n "$name" ] || die "usage: cam project add <name> --account <account> --directory <path>"
+  valid_name "$name" || die "invalid project name '$name'"
+  [ -n "$account" ] || die "--account is required"
+  [ -n "$directory" ] || die "--directory is required"
+  account_exists "$account" || die "no such account: $account (see 'cam account list')"
+
+  local abs; abs="$(abs_path "$directory")"
+  [ -d "$abs" ] || warn "directory does not exist yet: $abs"
+
+  local verb="Created"
+  project_exists "$name" && verb="Updated"
+
+  jq --arg n "$name" --arg a "$account" --arg d "$(contract_path "$abs")" \
+     '.projects[$n] = {account:$a, directory:$d}' "$CONFIG" | cfg_write
+
+  ok "$verb project '$name' → account '$account' in $(contract_path "$abs")"
+  dim "  Run it with: cam run $name"
+}
+
+cmd_project_list() {
+  local name n=0
+  printf '%-16s %-16s %s\n' "PROJECT" "ACCOUNT" "DIRECTORY"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    printf '%-16s %-16s %s\n' "$name" "$(project_account "$name")" "$(project_dir "$name")"
+    n=$((n + 1))
+  done < <(project_names)
+  [ "$n" -eq 0 ] && dim "(no projects yet — cam project add <name> --account <a> --directory <d>)"
+  return 0
+}
+
+cmd_project_remove() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: cam project remove <name>"
+  project_exists "$name" || die "no such project: $name"
+  jq --arg n "$name" 'del(.projects[$n])' "$CONFIG" | cfg_write
+  ok "Removed project '$name'"
+  dim "  The directory itself was not touched."
+}
+
+# ------------------------------------------------------------------- run ----
+
+cmd_run() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: cam run <project> [-- claude args...]"
+  shift || true
+  [ "${1:-}" = "--" ] && shift
+
+  project_exists "$name" || die "no such project: $name (see 'cam project list')"
+
+  local account dir cfgdir
+  account="$(project_account "$name")"
+  dir="$(expand_path "$(project_dir "$name")")"
+  account_exists "$account" || die "project '$name' points at missing account '$account'"
+  cfgdir="$(expand_path "$(account_dir "$account")")"
+
+  [ -d "$dir" ] || die "project directory does not exist: $dir"
+  [ -d "$cfgdir" ] || die "account config dir does not exist: $cfgdir
+Run: cam account login $account"
+
+  dim "→ $name  (account: $account)  $(contract_path "$dir")"
+  cd "$dir"
+  exec env CLAUDE_CONFIG_DIR="$cfgdir" claude "$@"
+}
+
+# ---------------------------------------------------------------- status ----
+
+cmd_status() {
+  local active="${CLAUDE_CONFIG_DIR:-}"
+  if [ -z "$active" ]; then
+    info "No CLAUDE_CONFIG_DIR set in this shell — Claude would use its default (~/.claude)."
+    return 0
+  fi
+
+  local name match=""
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if [ "$(expand_path "$(account_dir "$name")")" = "${active%/}" ]; then match="$name"; fi
+  done < <(account_names)
+
+  if [ -n "$match" ]; then
+    info "Active account: ${C_BOLD}$match${C_OFF}"
+    info "Config dir:     $(contract_path "$active")"
+  else
+    info "Active config dir: $active"
+    warn "not a cam-managed account"
+  fi
+}
+
+# ---------------------------------------------------------------- doctor ----
+
+cmd_doctor() {
+  local problems=0
+
+  if command -v claude >/dev/null 2>&1; then
+    ok "claude found at $(command -v claude)"
+  else
+    warn "claude is not on PATH"; problems=$((problems + 1))
+  fi
+
+  ok "config: $CONFIG"
+
+  local name dir email
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    dir="$(expand_path "$(account_dir "$name")")"
+    if [ ! -d "$dir" ]; then
+      warn "account '$name' config dir missing: $(contract_path "$dir")"
+      problems=$((problems + 1))
+      continue
+    fi
+    email="$(account_email "$name")"
+    if [ -z "$email" ]; then
+      warn "account '$name' → $(contract_path "$dir") — not logged in (run 'cam account login $name')"
+      problems=$((problems + 1))
+    elif has_credential "$dir"; then
+      ok "account '$name' → $(contract_path "$dir") — $email"
+    else
+      # Identity in .claude.json but no keychain entry: stale or hand-copied dir.
+      warn "account '$name' → $(contract_path "$dir") — $email, but no keychain credential (re-run 'cam account login $name')"
+      problems=$((problems + 1))
+    fi
+  done < <(account_names)
+
+  local acct pdir
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    acct="$(project_account "$name")"
+    pdir="$(expand_path "$(project_dir "$name")")"
+    if ! account_exists "$acct"; then
+      warn "project '$name' references unknown account '$acct'"; problems=$((problems + 1))
+    elif [ ! -d "$pdir" ]; then
+      warn "project '$name' directory missing: $(contract_path "$pdir")"; problems=$((problems + 1))
+    else
+      ok "project '$name' → $acct @ $(contract_path "$pdir")"
+    fi
+  done < <(project_names)
+
+  if [ "$(render_block)" = "$(current_block)" ]; then
+    ok "shell aliases in sync ($SHELL_RC)"
+  else
+    warn "shell aliases out of sync — run 'cam alias sync'"
+    problems=$((problems + 1))
+  fi
+
+  # Orphaned keychain credentials: entries whose hash matches no existing
+  # ~/.claude* config dir (the dir was deleted but its login lingers).
+  if command -v security >/dev/null 2>&1; then
+    local candidates="" d
+    for d in "$HOME"/.claude "$HOME"/.claude-*; do
+      [ -d "$d" ] && candidates="$candidates $(cred_hash "$d")"
+    done
+    local suffix
+    while IFS= read -r suffix; do
+      [ -n "$suffix" ] || continue
+      case " $candidates " in
+        *" $suffix "*) ;;
+        *) dim "note: orphaned keychain credential (no matching config dir): Claude Code-credentials-$suffix" ;;
+      esac
+    done < <(security dump-keychain 2>/dev/null \
+               | sed -n 's/.*"svce"<blob>="Claude Code-credentials-\([0-9a-f]*\)".*/\1/p' \
+               | sort -u)
+  fi
+
+  if [ -f "$LEGACY_CONFIG" ]; then
+    dim "note: legacy $LEGACY_CONFIG still present (left untouched)"
+  fi
+
+  printf '\n'
+  if [ "$problems" -eq 0 ]; then
+    ok "No problems found."
+  else
+    warn "$problems problem(s) found."
+    return 1
+  fi
+}
+
+# ------------------------------------------------------------------ help ----
+
+usage() {
+  cat <<EOF
+${C_BOLD}cam${C_OFF} — Claude Account Manager v$CAM_VERSION
+
+Run multiple Claude Code accounts on one machine, each with its own login.
+
+${C_BOLD}ACCOUNTS${C_OFF}   an isolated Claude login (its own CLAUDE_CONFIG_DIR)
+  cam account add <name>                 create + alias + prompt to log in
+  cam account list                       show all accounts
+  cam account login <name>               open Claude in that account to /login
+  cam account remove <name> [--purge]    unregister; --purge deletes the dir
+
+${C_BOLD}PROJECTS${C_OFF}   an account bound to a directory
+  cam project add <name> --account <a> --directory <path>
+  cam project list
+  cam project remove <name>
+
+${C_BOLD}RUNNING${C_OFF}
+  cam run <project>                      cd + set config dir + launch claude
+  cam run <project> -- --model opus      pass extra args through to claude
+
+${C_BOLD}ALIASES${C_OFF}
+  cam alias list                         show cam-managed shell aliases
+  cam alias sync                         rewrite the managed block in $SHELL_RC
+
+${C_BOLD}GENERAL${C_OFF}
+  cam list                               accounts and projects together
+  cam status                             which account is active in this shell
+  cam doctor                             health check for drift and missing paths
+
+${C_BOLD}EXAMPLE${C_OFF}
+  cam account add work
+  cam project add fintech --account work --directory ~/work/fintech
+  cam run fintech
+
+Config: $CONFIG
+EOF
+}
+
+cmd_list() {
+  printf '%sAccounts%s\n' "$C_BOLD" "$C_OFF"; cmd_account_list
+  printf '\n%sProjects%s\n' "$C_BOLD" "$C_OFF"; cmd_project_list
+}
+
+# ------------------------------------------------------------------ main ----
+
+main() {
+  local cmd="${1:-}"
+  [ $# -gt 0 ] && shift
+
+  case "$cmd" in
+    ''|-h|--help|help) usage; return 0 ;;
+    -v|--version) printf 'cam %s\n' "$CAM_VERSION"; return 0 ;;
+  esac
+
+  ensure_config
+
+  case "$cmd" in
+    account)
+      local sub="${1:-list}"; [ $# -gt 0 ] && shift
+      case "$sub" in
+        add)          cmd_account_add "$@" ;;
+        list|ls)      cmd_account_list ;;
+        login)        cmd_account_login "$@" ;;
+        remove|rm)    cmd_account_remove "$@" ;;
+        *) die "unknown: cam account $sub" ;;
+      esac ;;
+    project)
+      local sub="${1:-list}"; [ $# -gt 0 ] && shift
+      case "$sub" in
+        add)          cmd_project_add "$@" ;;
+        list|ls)      cmd_project_list ;;
+        remove|rm)    cmd_project_remove "$@" ;;
+        *) die "unknown: cam project $sub" ;;
+      esac ;;
+    alias)
+      local sub="${1:-list}"; [ $# -gt 0 ] && shift
+      case "$sub" in
+        list|ls) alias_list ;;
+        sync)    alias_sync ;;
+        *) die "unknown: cam alias $sub" ;;
+      esac ;;
+    run)     cmd_run "$@" ;;
+    list|ls) cmd_list ;;
+    status)  cmd_status ;;
+    doctor)  cmd_doctor ;;
+    *) die "unknown command: $cmd (try 'cam --help')" ;;
+  esac
+}
+
+main "$@"
