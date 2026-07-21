@@ -1,13 +1,14 @@
-# cam — Claude Account Manager
+# cam — Claude Access Manager
 
-Run multiple Claude Code accounts on one machine without repeatedly logging in
-and out. Each account gets its own `CLAUDE_CONFIG_DIR`, so logins stay isolated
-and simultaneously active.
+cam runs each project under the right Claude account, using a separate
+`CLAUDE_CONFIG_DIR` per account so logins don't collide.
 
-Built on Claude Code's `CLAUDE_CONFIG_DIR` environment variable: point each
-account at its own config directory and its login stays separate. cam manages
-those directories and the shell aliases for you instead of you hand-editing
-`~/.zshrc`.
+Set up one account per login you use (most people need two: personal and
+work), bind a directory to each as a project, then `cam <project>` cds in
+and launches Claude with the matching config dir.
+
+cam manages the `CLAUDE_CONFIG_DIR` directories and the `~/.zshrc` aliases
+so you don't hand-edit either.
 
 ## Install
 
@@ -45,7 +46,7 @@ skipped automatically elsewhere.
 cam account add work
 cam account login work        # run /login inside the session
 cam project add fintech --account work --directory ~/work/fintech
-cam run fintech               # cd + right account + launch claude
+cam fintech                   # cd + right account + launch claude
 ```
 
 ## Commands
@@ -60,6 +61,12 @@ cam account remove <name>              # unregister (config dir kept)
 cam account remove <name> --purge      # also delete the dir, with confirmation
 ```
 
+You'll usually set these up once — most people need two, personal and work.
+Each account is isolated: its own `CLAUDE_CONFIG_DIR`, its own login, and
+multiple accounts can be logged in at the same time. On first run, cam
+registers any pre-existing `~/.claude` as `default` automatically, so if you
+already had Claude Code set up you don't need to run `account add` for it.
+
 `cam account list` reads each account's logged-in email from its own
 `.claude.json`, so you can see at a glance which real account a directory
 currently holds. This catches the easy mistake of running plain `claude` and
@@ -71,7 +78,11 @@ other account `<n>` maps to `~/.claude-<n>` with the alias `claude-<n>`.
 
 ### Projects
 
+A project is an account bound to a directory. `cam <project>` cds into the
+directory and launches Claude under that account.
+
 ```bash
+cam <project>                          # cd + right account + launch claude
 cam project add <name> --account <a> --directory <path>
 cam project list
 cam project remove <name>              # never touches the directory itself
@@ -82,9 +93,14 @@ Re-running `project add` with an existing name updates it in place.
 ### Running
 
 ```bash
+cam <project>                          # same as the line below
 cam run <project>                      # cd + CLAUDE_CONFIG_DIR + exec claude
 cam run <project> -- --model opus      # extra args pass through to claude
 ```
+
+`project add` refuses to create a project whose name collides with a cam
+command (`account`, `project`, `alias`, `run`, `list`, `status`, `doctor`,
+`help`), so a bare `cam <name>` always resolves unambiguously.
 
 Runs in your current terminal — no tmux, no new windows.
 
@@ -99,7 +115,7 @@ cam only ever writes between its markers:
 
 ```bash
 # >>> claude-manager >>>   (managed by cam — do not edit inside these markers)
-alias claude='CLAUDE_CONFIG_DIR="$HOME/.claude" claude'
+alias claude='claude'
 alias claude-work='CLAUDE_CONFIG_DIR="$HOME/.claude-work" claude'
 # <<< claude-manager <<<
 ```
@@ -127,6 +143,11 @@ left behind by a deleted config dir.
 
 ## Design notes
 
+- **Projects for daily use, accounts for setup.** `cam <project>` (or `cam
+  run <project>` in scripts) is what you'll run day to day. Accounts are
+  configured once — most people need two — and are what let projects
+  switch identity safely: each one is an isolated, simultaneously active
+  Claude login.
 - **Config is the source of truth.** `~/.config/cam/config.json` holds
   everything; the `~/.zshrc` block is generated output. `cam doctor` reports
   drift between them.
@@ -159,10 +180,10 @@ between accounts, and any GUI.
 
 ## Environment overrides
 
-| Variable       | Default              | Purpose                          |
-| -------------- | -------------------- | -------------------------------- |
-| `CAM_HOME`     | `~/.config/cam`      | Config and backup location       |
-| `CAM_SHELL_RC` | `~/.zshrc`           | Which rc file to manage          |
+| Variable       | Default                                   | Purpose                     |
+| -------------- | ------------------------------------------ | --------------------------- |
+| `CAM_HOME`     | `~/.config/cam`                            | Config and backup location  |
+| `CAM_SHELL_RC` | auto-detected from `$SHELL` (see Install)  | Which rc file to manage     |
 
 Useful for trying cam against a throwaway rc file before pointing it at your
 real one.

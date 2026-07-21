@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
-# cam — Claude Account Manager
+# cam — Claude Access Manager
 #
-# Run multiple Claude Code accounts on one machine by giving each its own
-# CLAUDE_CONFIG_DIR. Manages accounts (isolated logins), projects (an account
-# bound to a directory), and the shell aliases that tie them together.
+# Give each project the right isolated Claude login, and jump into it with
+# one command. Accounts (each with its own CLAUDE_CONFIG_DIR) are the
+# isolated-login primitive, set up once; projects bind a directory to one of
+# them and are what you'll actually run day to day via `cam <project>`.
 #
 # Requires: bash 3.2+, jq
 
@@ -100,6 +101,16 @@ valid_name() {
 # and keychain entry at the unsuffixed locations, not the per-dir ones used
 # by every other (CLAUDE_CONFIG_DIR-backed) account.
 is_bare_default() { [ "$1" = "$HOME/.claude" ]; }
+
+# Top-level command words a project name must not shadow: a bare
+# `cam <name>` (see main()) falls back to `cam run <name>` only when <name>
+# isn't one of these.
+is_reserved_command() {
+  case "$1" in
+    account|project|alias|run|list|ls|status|doctor|help|-h|--help|-v|--version) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 # ---------------------------------------------------------------- config ----
 
@@ -470,6 +481,7 @@ cmd_project_add() {
 
   [ -n "$name" ] || die "usage: cam project add <name> --account <account> --directory <path>"
   valid_name "$name" || die "invalid project name '$name'"
+  is_reserved_command "$name" && die "project name '$name' collides with a cam command; choose another name"
   [ -n "$account" ] || die "--account is required"
   [ -n "$directory" ] || die "--directory is required"
   account_exists "$account" || die "no such account: $account (see 'cam account list')"
@@ -484,7 +496,7 @@ cmd_project_add() {
      '.projects[$n] = {account:$a, directory:$d}' "$CONFIG" | cfg_write
 
   ok "$verb project '$name' → account '$account' in $(contract_path "$abs")"
-  dim "  Run it with: cam run $name"
+  dim "  Run it with: cam $name"
 }
 
 cmd_project_list() {
@@ -656,23 +668,25 @@ cmd_doctor() {
 
 usage() {
   cat <<EOF
-${C_BOLD}cam${C_OFF} — Claude Account Manager v$CAM_VERSION
+${C_BOLD}cam${C_OFF} — Claude Access Manager v$CAM_VERSION
 
-Run multiple Claude Code accounts on one machine, each with its own login.
+Give each project the right isolated Claude login, and jump into it with
+one command.
 
-${C_BOLD}ACCOUNTS${C_OFF}   an isolated Claude login (its own CLAUDE_CONFIG_DIR)
+${C_BOLD}ACCOUNTS${C_OFF}   an isolated Claude login (its own CLAUDE_CONFIG_DIR) — set up once
   cam account add <name>                 create + alias + prompt to log in
   cam account list                       show all accounts
   cam account login <name>               open Claude in that account to /login
   cam account remove <name> [--purge]    unregister; --purge deletes the dir
 
-${C_BOLD}PROJECTS${C_OFF}   an account bound to a directory
+${C_BOLD}PROJECTS${C_OFF}   an account bound to a directory — what you'll use day to day
+  cam <project>                          jump in: cd + right account + launch claude
   cam project add <name> --account <a> --directory <path>
   cam project list
   cam project remove <name>
 
 ${C_BOLD}RUNNING${C_OFF}
-  cam run <project>                      cd + set config dir + launch claude
+  cam run <project>                      same as 'cam <project>', explicit form
   cam run <project> -- --model opus      pass extra args through to claude
 
 ${C_BOLD}ALIASES${C_OFF}
@@ -687,7 +701,7 @@ ${C_BOLD}GENERAL${C_OFF}
 ${C_BOLD}EXAMPLE${C_OFF}
   cam account add work
   cam project add fintech --account work --directory ~/work/fintech
-  cam run fintech
+  cam fintech
 
 Config: $CONFIG
 EOF
@@ -740,7 +754,15 @@ main() {
     list|ls) cmd_list ;;
     status)  cmd_status ;;
     doctor)  cmd_doctor ;;
-    *) die "unknown command: $cmd (try 'cam --help')" ;;
+    *)
+      # Bare `cam <project>` is shorthand for `cam run <project>` — the
+      # common case, since projects are what you'll type day to day.
+      if project_exists "$cmd"; then
+        cmd_run "$cmd" "$@"
+      else
+        die "unknown command: $cmd (try 'cam --help')"
+      fi
+      ;;
   esac
 }
 
