@@ -90,6 +90,17 @@ valid_name() {
   esac
 }
 
+# True only for Claude Code's own default config dir. Claude Code special-
+# cases it: its identity file and keychain entry live at fixed, unsuffixed
+# locations that apply ONLY when CLAUDE_CONFIG_DIR is left unset. Explicitly
+# exporting CLAUDE_CONFIG_DIR to this same path is NOT equivalent -- Claude
+# Code then looks for .claude.json inside the dir instead of the real
+# sibling file and reports the account as logged out. So cam must never
+# export CLAUDE_CONFIG_DIR for this account, and must look up its identity
+# and keychain entry at the unsuffixed locations, not the per-dir ones used
+# by every other (CLAUDE_CONFIG_DIR-backed) account.
+is_bare_default() { [ "$1" = "$HOME/.claude" ]; }
+
 # ---------------------------------------------------------------- config ----
 
 need_jq() {
@@ -118,12 +129,24 @@ project_exists() { [ -n "$(cfg_get ".projects[\"$1\"]")" ]; }
 account_names() { cfg -r '.accounts | keys_unsorted[]' 2>/dev/null || true; }
 project_names() { cfg -r '.projects | keys_unsorted[]' 2>/dev/null || true; }
 
-# The email currently logged in to a config dir, read from its own
-# .claude.json. Non-secret; empty when the dir has never been logged in.
+# Where Claude Code keeps the identity file for a config dir. The bare
+# default (~/.claude) is special-cased by Claude Code itself: see
+# is_bare_default above.
+identity_file() {
+  if is_bare_default "$1"; then
+    printf '%s\n' "$HOME/.claude.json"
+  else
+    printf '%s\n' "$1/.claude.json"
+  fi
+}
+
+# The email currently logged in to a config dir, read from its identity
+# file. Non-secret; empty when the dir has never been logged in.
 account_email() {
   local dir; dir="$(expand_path "$(account_dir "$1")")"
-  [ -f "$dir/.claude.json" ] || return 0
-  jq -r '.oauthAccount.emailAddress // empty' "$dir/.claude.json" 2>/dev/null || true
+  local f; f="$(identity_file "$dir")"
+  [ -f "$f" ] || return 0
+  jq -r '.oauthAccount.emailAddress // empty' "$f" 2>/dev/null || true
 }
 
 # Claude Code names each keychain entry Claude Code-credentials-<hash>, where
@@ -138,11 +161,18 @@ cred_hash() {
   fi
 }
 
-# Whether a keychain credential entry exists for a config dir.
+# Whether a keychain credential entry exists for a config dir. The bare
+# default (~/.claude) stores its entry under the plain, unsuffixed service
+# name; every other (CLAUDE_CONFIG_DIR-backed) account gets a hashed one.
 has_credential() {
   command -v security >/dev/null 2>&1 || return 1
-  local h; h="$(cred_hash "$1")"
-  security find-generic-password -s "Claude Code-credentials-$h" >/dev/null 2>&1
+  local svc
+  if is_bare_default "$1"; then
+    svc="Claude Code-credentials"
+  else
+    svc="Claude Code-credentials-$(cred_hash "$1")"
+  fi
+  security find-generic-password -s "$svc" >/dev/null 2>&1
 }
 
 # Derive an account name from a config dir basename: .claude-work -> work,
@@ -205,6 +235,14 @@ migrate_legacy() {
     done < <(sed -n "/$MARK_BEGIN/,/$MARK_END/p" "$SHELL_RC")
   fi
 
+  # A bare, pre-existing ~/.claude dir is Claude Code's own default location,
+  # used whether or not cam is involved. Register it as account 'default' so
+  # a first-time cam install reflects a setup that's already there, even
+  # when there's no legacy claude-manager config or existing alias to adopt.
+  if ! account_exists "default" && [ -d "$HOME/.claude" ]; then
+    register_account "default" "$HOME/.claude" "claude" && found=1
+  fi
+
   if [ "$found" -eq 1 ]; then
     ok "Adopted existing claude-manager setup into $CONFIG"
     dim "  Run 'cam list' to review, 'cam alias sync' to regenerate your shell aliases."
@@ -232,13 +270,20 @@ register_account() {
 
 render_block() {
   printf '%s   (managed by cam — do not edit inside these markers)\n' "$MARK_BEGIN"
-  local name dir alias_name
+  local name dir alias_name expanded
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     dir="$(account_dir "$name")"
     alias_name="$(account_alias "$name")"
-    printf 'alias %s=%sCLAUDE_CONFIG_DIR="%s" claude%s\n' \
-      "$alias_name" "'" "${dir/#\~/\$HOME}" "'"
+    expanded="$(expand_path "$dir")"
+    if is_bare_default "$expanded"; then
+      # See is_bare_default: exporting CLAUDE_CONFIG_DIR here would break
+      # the default account's login instead of being a harmless no-op.
+      printf 'alias %s=%sclaude%s\n' "$alias_name" "'" "'"
+    else
+      printf 'alias %s=%sCLAUDE_CONFIG_DIR="%s" claude%s\n' \
+        "$alias_name" "'" "${dir/#\~/\$HOME}" "'"
+    fi
   done < <(account_names)
   printf '%s\n' "$MARK_END"
 }
@@ -402,7 +447,11 @@ cmd_account_login() {
   local dir; dir="$(expand_path "$(account_dir "$name")")"
   mkdir -p "$dir"
   info "Starting Claude with account '$name'. Run /login inside the session."
-  exec env CLAUDE_CONFIG_DIR="$dir" claude
+  if is_bare_default "$dir"; then
+    exec claude
+  else
+    exec env CLAUDE_CONFIG_DIR="$dir" claude
+  fi
 }
 
 # -------------------------------------------------------------- projects ----
@@ -481,7 +530,11 @@ Run: cam account login $account"
 
   dim "→ $name  (account: $account)  $(contract_path "$dir")"
   cd "$dir"
-  exec env CLAUDE_CONFIG_DIR="$cfgdir" claude "$@"
+  if is_bare_default "$cfgdir"; then
+    exec claude "$@"
+  else
+    exec env CLAUDE_CONFIG_DIR="$cfgdir" claude "$@"
+  fi
 }
 
 # ---------------------------------------------------------------- status ----

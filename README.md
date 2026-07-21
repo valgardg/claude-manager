@@ -117,11 +117,13 @@ cam doctor                             # drift, missing dirs, stale aliases, log
 
 `cam doctor` also verifies each account's login: it reports the email in each
 dir, warns about dirs that were never logged in, and cross-checks the macOS
-Keychain — Claude Code stores each account's OAuth token under
+Keychain. Every account *except* `default` stores its OAuth token under
 `Claude Code-credentials-<hash>`, where `<hash>` is the first 8 hex of the
-sha256 of the config dir path. It flags an account whose `.claude.json` has an
-identity but no matching keychain entry (a stale or hand-copied dir), and notes
-orphaned keychain credentials left behind by a deleted config dir.
+sha256 of the config dir path; `default` uses the plain, unsuffixed
+`Claude Code-credentials` entry instead (see the design note below). Doctor
+flags an account whose identity file has an email but no matching keychain
+entry (a stale or hand-copied dir), and notes orphaned keychain credentials
+left behind by a deleted config dir.
 
 ## Design notes
 
@@ -136,7 +138,19 @@ orphaned keychain credentials left behind by a deleted config dir.
   project is repointed or deleted.
 - **Adopts existing setups.** On first run, cam imports accounts from a prior
   `~/.claude-manager.json` and from any aliases already in the managed rc
-  block, then reuses the same markers so you don't end up with two blocks.
+  block, then reuses the same markers so you don't end up with two blocks. It
+  also registers a bare, pre-existing `~/.claude` as the `default` account
+  even without either of those, since that's Claude Code's own default
+  location whether or not cam is involved.
+- **`default` never sets `CLAUDE_CONFIG_DIR`.** Claude Code special-cases an
+  *unset* `CLAUDE_CONFIG_DIR`: only then does it read the identity file from
+  the legacy, top-level `~/.claude.json`. Exporting `CLAUDE_CONFIG_DIR`
+  explicitly — even to that same `~/.claude` path — makes Claude Code look
+  for `.claude.json` *inside* that directory instead, find nothing, and
+  report the account as logged out. So the `default` alias, `cam run`, and
+  `cam account login` all invoke `claude` bare for this one account instead
+  of exporting the var, and `cam doctor`/`account list` read the identity
+  and keychain entry from the unsuffixed, legacy locations for it.
 
 ## Not in scope
 
