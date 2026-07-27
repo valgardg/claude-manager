@@ -7,15 +7,30 @@
 # isolated-login primitive, set up once; projects bind a directory to one of
 # them and are what you'll actually run day to day via `cam <project>`.
 #
+# Each account also gets an executable shim in $CAM_HOME/bin rather than a
+# shell alias. A shim is picked up by shells that are *already running* — a
+# new command name has never been in the shell's hash table, so there is
+# nothing stale to clear — whereas an alias only ever reaches shells started
+# after it was written, which is why the old approach needed a `source` after
+# every `account add`. cam is a child process and can never mutate the shell
+# that launched it, so a shim is the only way to make a new account usable
+# immediately. Shims also work in scripts and non-interactive shells, where
+# aliases do not exist at all.
+#
 # Requires: bash 3.2+, jq
 
 set -euo pipefail
 
-CAM_VERSION="1.0.0"
+CAM_VERSION="1.1.0"
 CAM_HOME="${CAM_HOME:-$HOME/.config/cam}"
 CONFIG="$CAM_HOME/config.json"
 BACKUP_DIR="$CAM_HOME/backups"
+BIN_DIR="$CAM_HOME/bin"
 LEGACY_CONFIG="$HOME/.claude-manager.json"
+
+# Every generated shim carries this line, so pruning only ever deletes files
+# cam itself wrote and never anything else the user keeps in the bin dir.
+SHIM_MARK="# managed by cam"
 
 # Pick a sensible rc file when CAM_SHELL_RC isn't set: honor the user's actual
 # login shell rather than assuming zsh, since cam also runs on Linux/bash.
@@ -107,9 +122,35 @@ is_bare_default() { [ "$1" = "$HOME/.claude" ]; }
 # isn't one of these.
 is_reserved_command() {
   case "$1" in
-    account|project|alias|run|list|ls|status|doctor|help|-h|--help|-v|--version) return 0 ;;
+    account|project|alias|shim|shims|run|list|ls|status|doctor|help|-h|--help|-v|--version) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# Is cam's bin dir on PATH in this shell?
+bin_on_path() {
+  case ":$PATH:" in
+    *":$BIN_DIR:"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The real claude executable, never a cam shim. The 'default' account owns a
+# shim called plain 'claude', so anything in cam that launches Claude itself
+# must bypass the bin dir — otherwise that shim would intercept the call and
+# re-decide CLAUDE_CONFIG_DIR for us.
+real_claude() {
+  ( set -f; IFS=:; local p out=""
+    for p in $PATH; do
+      if [ "$p" != "$BIN_DIR" ]; then out="${out:+$out:}$p"; fi
+    done
+    PATH="$out" command -v claude 2>/dev/null || true )
+}
+
+need_real_claude() {
+  local bin; bin="$(real_claude)"
+  [ -n "$bin" ] || die "claude is not installed or not on PATH"
+  printf '%s\n' "$bin"
 }
 
 # ---------------------------------------------------------------- config ----
@@ -254,9 +295,29 @@ migrate_legacy() {
     register_account "default" "$HOME/.claude" "claude" && found=1
   fi
 
+  # Adopt shims from a previous cam install whose config was lost. Without this,
+  # rebuilding the config would leave working commands in the bin dir that cam
+  # no longer knows about — and would then prune them on the next sync.
+  if [ -d "$BIN_DIR" ]; then
+    local f base cdir
+    for f in "$BIN_DIR"/*; do
+      [ -f "$f" ] || continue
+      grep -qF "$SHIM_MARK" "$f" 2>/dev/null || continue
+      base="$(basename "$f")"
+      cdir="$(sed -n 's/^CLAUDE_CONFIG_DIR="\(.*\)"$/\1/p' "$f" | head -1)"
+      if [ -n "$cdir" ]; then
+        cdir="${cdir/\$HOME/$HOME}"
+      else
+        # No export line at all means the bare-default shim (see shim_body).
+        cdir="$HOME/.claude"
+      fi
+      register_account "$(name_from_dir "$cdir")" "$cdir" "$base" && found=1
+    done
+  fi
+
   if [ "$found" -eq 1 ]; then
     ok "Adopted existing claude-manager setup into $CONFIG"
-    dim "  Run 'cam list' to review, 'cam alias sync' to regenerate your shell aliases."
+    dim "  Run 'cam list' to review, 'cam shim sync' to write the account commands."
   fi
 }
 
@@ -277,26 +338,114 @@ register_account() {
   return 0
 }
 
-# --------------------------------------------------------------- aliases ----
+# ----------------------------------------------------------------- shims ----
 
+# Write $HOME-relative so generated files stay portable between machines.
+home_ref() {
+  local p; p="$(contract_path "$1")"
+  printf '%s' "${p/#\~/\$HOME}"
+}
+
+# The rc block is now just a PATH entry: one line, written once, never
+# rewritten when accounts change. That is the whole point of the shim design —
+# adding an account no longer touches the rc file, so there is nothing to
+# re-source. Kept POSIX so it works in zsh and bash alike (see
+# default_shell_rc). The case guard stops PATH growing if the rc is sourced
+# more than once.
 render_block() {
+  local bin_ref; bin_ref="$(home_ref "$BIN_DIR")"
   printf '%s   (managed by cam — do not edit inside these markers)\n' "$MARK_BEGIN"
-  local name dir alias_name expanded
+  printf "# Puts cam's per-account commands (claude, claude-<name>, …) on PATH.\n"
+  printf 'case ":$PATH:" in\n'
+  printf '  *":%s:"*) ;;\n' "$bin_ref"
+  printf '  *) export PATH="%s:$PATH" ;;\n' "$bin_ref"
+  printf 'esac\n'
+  # cam <=1.0 defined these names as aliases. An alias beats a PATH lookup, so
+  # a shell that still has one in memory would expand 'claude-personal' to
+  # plain 'claude' and hit the default account's shim instead — the wrong
+  # account, silently. Retire only names cam owns, i.e. those it has a shim
+  # for, so the user's own aliases are left alone.
+  printf 'for _cam_f in "%s"/*; do\n' "$bin_ref"
+  printf '  [ -f "$_cam_f" ] && unalias "${_cam_f##*/}" 2>/dev/null\n'
+  printf 'done\n'
+  printf 'unset _cam_f\n'
+  printf '%s\n' "$MARK_END"
+}
+
+# The shim for one account. $HOME and $PATH are left for the shim to expand at
+# run time rather than being baked in here.
+shim_body() {
+  local acct="$1" dir cfg_ref bin_ref
+  dir="$(expand_path "$(account_dir "$acct")")"
+  bin_ref="$(home_ref "$BIN_DIR")"
+
+  printf '#!/bin/sh\n'
+  printf '%s — do not edit. Regenerate with: cam shim sync\n' "$SHIM_MARK"
+  printf '# account: %s\n' "$acct"
+  if is_bare_default "$dir"; then
+    # See is_bare_default: Claude Code reads the top-level ~/.claude.json only
+    # when CLAUDE_CONFIG_DIR is *unset*. Setting it — even to this same path —
+    # makes it look inside the dir instead and report the account logged out.
+    # So this shim exports nothing and actively clears an inherited value,
+    # which the old alias could not do.
+    printf 'unset CLAUDE_CONFIG_DIR\n'
+  else
+    cfg_ref="$(home_ref "$dir")"
+    printf 'CLAUDE_CONFIG_DIR="%s"\n' "$cfg_ref"
+    printf 'export CLAUDE_CONFIG_DIR\n'
+  fi
+  cat <<EOF
+
+# Launch the real claude, not this shim, by dropping cam's bin dir from PATH.
+cam_bin="$bin_ref"
+set -f; IFS=:; cam_path=
+for cam_p in \$PATH; do
+  if [ "\$cam_p" != "\$cam_bin" ]; then cam_path="\${cam_path:+\$cam_path:}\$cam_p"; fi
+done
+unset IFS; set +f
+PATH="\$cam_path"; export PATH
+
+if ! command -v claude >/dev/null 2>&1; then
+  printf 'cam: claude not found on PATH outside %s\n' "\$cam_bin" >&2
+  exit 127
+fi
+exec claude "\$@"
+EOF
+}
+
+# Bring $BIN_DIR in line with the config: write missing or changed shims, make
+# them executable, and prune shims for accounts that no longer exist.
+SHIMS_CHANGED=0
+write_shims() {
+  SHIMS_CHANGED=0
+  mkdir -p "$BIN_DIR"
+
+  local name cmd path body want=":"
   while IFS= read -r name; do
     [ -n "$name" ] || continue
-    dir="$(account_dir "$name")"
-    alias_name="$(account_alias "$name")"
-    expanded="$(expand_path "$dir")"
-    if is_bare_default "$expanded"; then
-      # See is_bare_default: exporting CLAUDE_CONFIG_DIR here would break
-      # the default account's login instead of being a harmless no-op.
-      printf 'alias %s=%sclaude%s\n' "$alias_name" "'" "'"
-    else
-      printf 'alias %s=%sCLAUDE_CONFIG_DIR="%s" claude%s\n' \
-        "$alias_name" "'" "${dir/#\~/\$HOME}" "'"
+    cmd="$(account_alias "$name")"
+    [ -n "$cmd" ] || continue
+    want="$want$cmd:"
+    path="$BIN_DIR/$cmd"
+    body="$(shim_body "$name")"
+    if [ ! -f "$path" ] || [ "$(cat "$path")" != "$body" ]; then
+      printf '%s\n' "$body" > "$path"
+      SHIMS_CHANGED=$((SHIMS_CHANGED + 1))
     fi
+    [ -x "$path" ] || chmod +x "$path"
   done < <(account_names)
-  printf '%s\n' "$MARK_END"
+
+  local f base
+  for f in "$BIN_DIR"/*; do
+    [ -f "$f" ] || continue
+    grep -qF "$SHIM_MARK" "$f" 2>/dev/null || continue
+    base="$(basename "$f")"
+    case "$want" in
+      *":$base:"*) ;;
+      *) rm -f "$f"; SHIMS_CHANGED=$((SHIMS_CHANGED + 1))
+         dim "  removed stale command '$base'" ;;
+    esac
+  done
 }
 
 backup_rc() {
@@ -312,15 +461,20 @@ current_block() {
   sed -n "/$MARK_BEGIN/,/$MARK_END/p" "$SHELL_RC"
 }
 
-alias_sync() {
-  local desired current
+# Write the PATH block. Separate from write_shims because this is the only part
+# that needs a re-source, and it happens at most once per machine.
+rc_sync() {
+  local desired current had_aliases=0
   desired="$(render_block)"
   current="$(current_block)"
 
   if [ "$desired" = "$current" ]; then
-    ok "Shell aliases already in sync ($SHELL_RC)"
     return 0
   fi
+
+  case "$current" in
+    *"alias "*) had_aliases=1 ;;
+  esac
 
   backup_rc
   local tmp="$CAM_HOME/rc.tmp.$$"
@@ -344,26 +498,60 @@ alias_sync() {
 
   rm -f "$blockfile"
   mv "$tmp" "$SHELL_RC"
-  ok "Wrote shell aliases to $SHELL_RC"
+  ok "Added cam's bin dir to PATH in $SHELL_RC"
   dim "  Backup in $BACKUP_DIR/"
-  dim "  Run: source $SHELL_RC"
+  if [ "$had_aliases" -eq 1 ]; then
+    info "Converted the old alias block to per-account commands."
+    dim "  Terminals opened before now still hold the old aliases in memory:"
+    dim "  run 'source $SHELL_RC' in them, or just open a new one."
+  fi
+  return 0
 }
 
-alias_list() {
-  local name alias_name dir n=0
-  printf '%-16s %-22s %s\n' "ALIAS" "ACCOUNT" "CONFIG DIR"
+# Tell the user whether the command they just gained is usable right now. A shim
+# is live immediately in every open shell; only the one-time PATH entry needs a
+# re-source, and only in shells started before it was written.
+path_hint() {
+  if bin_on_path; then
+    return 0
+  fi
+  printf '\n'
+  warn "$(contract_path "$BIN_DIR") is not on this shell's PATH yet"
+  dim "  One time only: source $SHELL_RC"
+  dim "  New terminals pick it up on their own."
+}
+
+shim_sync() {
+  write_shims
+  rc_sync
+  if [ "$SHIMS_CHANGED" -eq 0 ]; then
+    ok "Account commands already in sync ($(contract_path "$BIN_DIR"))"
+  else
+    ok "Synced account commands in $(contract_path "$BIN_DIR")"
+  fi
+  path_hint
+}
+
+shim_list() {
+  local name cmd n=0 stale=0
+  printf '%-16s %-22s %s\n' "COMMAND" "ACCOUNT" "CONFIG DIR"
   while IFS= read -r name; do
     [ -n "$name" ] || continue
-    printf '%-16s %-22s %s\n' "$(account_alias "$name")" "$name" "$(account_dir "$name")"
+    cmd="$(account_alias "$name")"
+    printf '%-16s %-22s %s\n' "$cmd" "$name" "$(account_dir "$name")"
+    [ -x "$BIN_DIR/$cmd" ] || stale=1
     n=$((n + 1))
   done < <(account_names)
   [ "$n" -eq 0 ] && dim "(no accounts yet — cam account add <name>)"
 
-  local desired current
-  desired="$(render_block)"; current="$(current_block)"
-  if [ "$desired" != "$current" ]; then
+  if [ "$stale" -eq 1 ]; then
     printf '\n'
-    warn "$SHELL_RC is out of sync — run 'cam alias sync'"
+    warn "some commands are missing from $(contract_path "$BIN_DIR") — run 'cam shim sync'"
+  elif [ "$(render_block)" != "$(current_block)" ]; then
+    printf '\n'
+    warn "$SHELL_RC has no cam PATH entry — run 'cam shim sync'"
+  else
+    path_hint
   fi
   return 0
 }
@@ -383,15 +571,23 @@ cmd_account_add() {
   register_account "$name" "$dir" || die "failed to register account"
   ok "Created account '$name' → $(contract_path "$dir")"
 
-  alias_sync
+  local cmd; cmd="$(account_alias "$name")"
+  write_shims
+  rc_sync
+  ok "Created command '$cmd'"
+
   printf '\n'
   info "Next: log in to this account."
   dim "  cam account login $name        # then run /login inside the session"
+  if bin_on_path; then
+    dim "$(printf '  %-30s# then just this, from any directory' "$cmd")"
+  fi
+  path_hint
 }
 
 cmd_account_list() {
   local name dir email n=0
-  printf '%-12s %-20s %-16s %s\n' "ACCOUNT" "CONFIG DIR" "ALIAS" "LOGGED IN AS"
+  printf '%-12s %-20s %-16s %s\n' "ACCOUNT" "CONFIG DIR" "COMMAND" "LOGGED IN AS"
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     dir="$(expand_path "$(account_dir "$name")")"
@@ -429,10 +625,15 @@ cmd_account_remove() {
   [ -n "$bound" ] && die "account '$name' is used by project(s): $bound
 Remove those projects first, or repoint them with 'cam project add ... --account <other>'."
 
-  local dir; dir="$(expand_path "$(account_dir "$name")")"
+  local dir cmd
+  dir="$(expand_path "$(account_dir "$name")")"
+  cmd="$(account_alias "$name")"
 
   jq --arg n "$name" 'del(.accounts[$n])' "$CONFIG" | cfg_write
   ok "Unregistered account '$name'"
+  if [ -n "$cmd" ]; then
+    dim "  Removed the '$cmd' command."
+  fi
 
   if [ "$purge" -eq 1 ]; then
     if [ -d "$dir" ]; then
@@ -448,20 +649,24 @@ Remove those projects first, or repoint them with 'cam project add ... --account
     dim "  Use --purge to delete it."
   fi
 
-  alias_sync
+  write_shims
 }
 
 cmd_account_login() {
   local name="${1:-}"
   [ -n "$name" ] || die "usage: cam account login <name>"
   account_exists "$name" || die "no such account: $name"
-  local dir; dir="$(expand_path "$(account_dir "$name")")"
+  local dir bin
+  dir="$(expand_path "$(account_dir "$name")")"
+  bin="$(need_real_claude)"
   mkdir -p "$dir"
   info "Starting Claude with account '$name'. Run /login inside the session."
   if is_bare_default "$dir"; then
-    exec claude
+    # -u, not just "don't set it": an inherited CLAUDE_CONFIG_DIR from the
+    # calling shell would break this account exactly as setting it would.
+    exec env -u CLAUDE_CONFIG_DIR "$bin"
   else
-    exec env CLAUDE_CONFIG_DIR="$dir" claude
+    exec env CLAUDE_CONFIG_DIR="$dir" "$bin"
   fi
 }
 
@@ -530,7 +735,7 @@ cmd_run() {
 
   project_exists "$name" || die "no such project: $name (see 'cam project list')"
 
-  local account dir cfgdir
+  local account dir cfgdir bin
   account="$(project_account "$name")"
   dir="$(expand_path "$(project_dir "$name")")"
   account_exists "$account" || die "project '$name' points at missing account '$account'"
@@ -540,12 +745,13 @@ cmd_run() {
   [ -d "$cfgdir" ] || die "account config dir does not exist: $cfgdir
 Run: cam account login $account"
 
+  bin="$(need_real_claude)"
   dim "→ $name  (account: $account)  $(contract_path "$dir")"
   cd "$dir"
   if is_bare_default "$cfgdir"; then
-    exec claude "$@"
+    exec env -u CLAUDE_CONFIG_DIR "$bin" "$@"
   else
-    exec env CLAUDE_CONFIG_DIR="$cfgdir" claude "$@"
+    exec env CLAUDE_CONFIG_DIR="$cfgdir" "$bin" "$@"
   fi
 }
 
@@ -578,13 +784,21 @@ cmd_status() {
 cmd_doctor() {
   local problems=0
 
-  if command -v claude >/dev/null 2>&1; then
-    ok "claude found at $(command -v claude)"
+  local claude_bin; claude_bin="$(real_claude)"
+  if [ -n "$claude_bin" ]; then
+    ok "claude found at $claude_bin"
   else
     warn "claude is not on PATH"; problems=$((problems + 1))
   fi
 
   ok "config: $CONFIG"
+
+  if bin_on_path; then
+    ok "commands on PATH ($(contract_path "$BIN_DIR"))"
+  else
+    warn "$(contract_path "$BIN_DIR") is not on PATH in this shell — run: source $SHELL_RC"
+    problems=$((problems + 1))
+  fi
 
   local name dir email
   while IFS= read -r name; do
@@ -625,10 +839,27 @@ cmd_doctor() {
     fi
   done < <(project_names)
 
-  if [ "$(render_block)" = "$(current_block)" ]; then
-    ok "shell aliases in sync ($SHELL_RC)"
+  local cmd missing=""
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    cmd="$(account_alias "$name")"
+    if [ ! -x "$BIN_DIR/$cmd" ]; then missing="$missing $cmd"; fi
+  done < <(account_names)
+  if [ -n "$missing" ]; then
+    warn "missing command shim(s):$missing — run 'cam shim sync'"
+    problems=$((problems + 1))
   else
-    warn "shell aliases out of sync — run 'cam alias sync'"
+    ok "account commands present in $(contract_path "$BIN_DIR")"
+  fi
+
+  if [ "$(render_block)" = "$(current_block)" ]; then
+    ok "PATH entry in place ($SHELL_RC)"
+  else
+    if current_block | grep -q '^alias '; then
+      warn "$SHELL_RC still holds the old alias block — run 'cam shim sync' to convert it"
+    else
+      warn "$SHELL_RC has no cam PATH entry — run 'cam shim sync'"
+    fi
     problems=$((problems + 1))
   fi
 
@@ -674,7 +905,7 @@ Give each project the right isolated Claude login, and jump into it with
 one command.
 
 ${C_BOLD}ACCOUNTS${C_OFF}   an isolated Claude login (its own CLAUDE_CONFIG_DIR) — set up once
-  cam account add <name>                 create + alias + prompt to log in
+  cam account add <name>                 create + command + prompt to log in
   cam account list                       show all accounts
   cam account login <name>               open Claude in that account to /login
   cam account remove <name> [--purge]    unregister; --purge deletes the dir
@@ -688,10 +919,11 @@ ${C_BOLD}PROJECTS${C_OFF}   an account bound to a directory — what you'll use 
 ${C_BOLD}RUNNING${C_OFF}
   cam run <project>                      same as 'cam <project>', explicit form
   cam run <project> -- --model opus      pass extra args through to claude
+  claude-<name>                          launch an account directly, anywhere
 
-${C_BOLD}ALIASES${C_OFF}
-  cam alias list                         show cam-managed shell aliases
-  cam alias sync                         rewrite the managed block in $SHELL_RC
+${C_BOLD}COMMANDS${C_OFF}   one executable per account, in $(contract_path "$BIN_DIR")
+  cam shim list                          show each account's command
+  cam shim sync                          rewrite the commands and the PATH entry
 
 ${C_BOLD}GENERAL${C_OFF}
   cam list                               accounts and projects together
@@ -743,12 +975,14 @@ main() {
         remove|rm)    cmd_project_remove "$@" ;;
         *) die "unknown: cam project $sub" ;;
       esac ;;
-    alias)
+    # 'alias' is kept as a synonym: it is what earlier versions called this and
+    # what existing muscle memory reaches for.
+    shim|shims|alias)
       local sub="${1:-list}"; [ $# -gt 0 ] && shift
       case "$sub" in
-        list|ls) alias_list ;;
-        sync)    alias_sync ;;
-        *) die "unknown: cam alias $sub" ;;
+        list|ls) shim_list ;;
+        sync)    shim_sync ;;
+        *) die "unknown: cam $cmd $sub" ;;
       esac ;;
     run)     cmd_run "$@" ;;
     list|ls) cmd_list ;;
